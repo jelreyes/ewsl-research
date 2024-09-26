@@ -12,26 +12,31 @@ import numpy as np
 import os
 import sql_connector as db
 
-def get_rain_gauge(select_sites=False, sites=None):
-    query_rg = "SELECT gauge_name, date_activated, date_deactivated "
-    query_rg += "FROM analysis_db.rainfall_gauges "
-    query_rg += "WHERE data_source = 'senslope' "
-    if select_sites:
-        query_rg += "AND gauge_name regexp '{sites}' ".format(sites=sites)
-    rg = db.df_read(query_rg)
-
+def get_rain_gauge(sql=True, to_csv=False):
+    if sql:
+        query_rg = "SELECT gauge_name, date_activated, date_deactivated "
+        query_rg += "FROM analysis_db.rainfall_gauges "
+        query_rg += "WHERE data_source = 'senslope' " #get senslope-installed rain gauges only 
+        rg = db.df_read(query_rg)
+        if to_csv:
+            rg.to_csv(output_path + 'raingauge.csv')
+    else:
+        rg = pd.read_csv(output_path + 'raingauge.csv')
     return rg
 
-def get_threshold():
-    query_threshold = "SELECT site_code, threshold_value  "
-    query_threshold += "FROM analysis_db.rainfall_thresholds "
-    query_threshold += "LEFT JOIN commons_db.sites USING (site_id) "
-    threshold = db.df_read(query_threshold)
-    
+def get_threshold(sql=True, to_csv=False):
+    if sql:
+        query_threshold = "SELECT site_code, threshold_value  "
+        query_threshold += "FROM analysis_db.rainfall_thresholds "
+        query_threshold += "LEFT JOIN commons_db.sites USING (site_id) "
+        threshold = db.df_read(query_threshold)
+        if to_csv:
+            threshold.to_csv(output_path + 'threshold.csv')
+    else:
+        threshold = pd.read_csv(output_path + 'threshold.csv')
     return threshold
 
-def get_rain_data(start, end, to_csv=False):
-    
+def get_rain_data(start, end, sql=True, to_csv=False):
     """Gets rainfall data from all identified ARGs in get_rain_gauge(), resamples
         every 30 mins, and computes one-day and three-day cumuulative rainfall
         values
@@ -42,49 +47,46 @@ def get_rain_data(start, end, to_csv=False):
         Returns:
             all_rain (dataframe): summary of rainfall data for all sites; contains ts, data_id, rain, source, OneDayCumulative,
                    ThreeDayCumulative, site_code, threshold_value
-            percent_true_rain (bool): export true data to csv
     """
     
-    rain_data = [] #for resampled rain
+    rain_data = [] #for resampled rain data
     true_rain_data = [] #for counting true/raw data
     
     rg = get_rain_gauge()
     
-    #get all rainfall data, resample every 30 mins, fill NaN values with 0, append to empty df
+    #get rainfall datafrom gauge name in rg, resample every 30 mins, fill NaN values with 0, append to empty df
     for index, row in rg.iterrows():
         gauge_name = row['gauge_name']
         date_activated = row['date_activated']
         date_deactivated = row['date_deactivated']
         
-        query_rain = "SELECT data_id, ts, rain "
-        query_rain += "FROM analysis_db.rain_{} ".format(gauge_name)
-        query_rain += "WHERE ts NOT IN ( "
-        query_rain += "SELECT ts FROM analysis_db.rain_{} ".format(gauge_name)
-        query_rain += "GROUP BY ts "
-        query_rain += "HAVING count(*)>1) "
-        query_rain += "AND rain >= 0 "
-        
-        # Check if date_deactivated is not null
-        if pd.notna(date_deactivated):
-            query_rain += " AND ts BETWEEN '{date_activated}' AND '{date_deactivated}'".format(date_activated=date_activated, date_deactivated=date_deactivated)
+        if sql:
+            query_rain = "SELECT data_id, ts, rain "
+            query_rain += "FROM analysis_db.rain_{} ".format(gauge_name)
+            query_rain += "WHERE ts NOT IN ( "
+            query_rain += "SELECT ts FROM analysis_db.rain_{} ".format(gauge_name)
+            query_rain += "GROUP BY ts "
+            query_rain += "HAVING count(*)>1) "
+            query_rain += "AND rain >= 0 "   
+            # Check if date_deactivated is not null (active)
+            if pd.notna(date_deactivated):
+                query_rain += " AND ts BETWEEN '{date_activated}' AND '{date_deactivated}'".format(date_activated=date_activated, date_deactivated=date_deactivated)
+            else:
+                query_rain += " AND ts BETWEEN '{date_activated}' AND '{end}'".format(date_activated=date_activated, end=end)
+            rain = db.df_read(query_rain)
+            if to_csv:
+                rain.to_csv(output_path + f"rain_{gauge_name}.csv")
         else:
-            # Handle the case when date_deactivated is null
-            query_rain += " AND ts BETWEEN '{date_activated}' AND '{end}'".format(date_activated=date_activated, end=end)
-    
-        rain = db.df_read(query_rain)
-        
+            rain = pd.read_csv(output_path + f"rain_{gauge_name}.csv")
         rain['source'] = gauge_name
-        
         rain['ts'] = pd.to_datetime(rain['ts'])
         
         true_rain_data.append(rain)
         
         ############################ resampled rain ###############################################
         resampled_rain = rain.set_index('ts').resample('30T').sum()
-        
         resampled_rain['rain'].fillna(0, inplace=True)
-        
-        # cap to 30 mm
+        # cap to 30mm (torrential)
         resampled_rain.loc[resampled_rain['rain'] > 30, 'rain'] = 30
         
         ############################ cumulative value #############################################
@@ -117,7 +119,7 @@ def get_rain_data(start, end, to_csv=False):
     all_rain.sort_values(['source','ts'], inplace = True)
     all_rain['source'] = all_rain['source'].replace({0: np.nan}).fillna(method='ffill')
     
-    #get site_code
+    #get site_code since each rain data table is not connected to site table
     all_rain['site_code'] = all_rain['source'].str[:3]
     all_rain = all_rain.reset_index()
     all_rain = all_rain.drop_duplicates(subset=['ts', 'site_code'])
@@ -132,66 +134,63 @@ def get_rain_data(start, end, to_csv=False):
     true_rain_data = true_rain_data.reset_index()
     true_rain_data = true_rain_data.drop_duplicates(subset=['ts', 'site_code'])
     true_rain_data.sort_values(['source','ts'], inplace = True)
-    resampled_data = all_rain.groupby('site_code').size().reset_index(name='resampled_Count')
-    true_data = true_rain_data.groupby('site_code').size().reset_index(name='true_Count')
+    resampled_data = all_rain.groupby('site_code').size().reset_index(name='resampled_count')
+    true_data = true_rain_data.groupby('site_code').size().reset_index(name='true_count')
     percent_true = pd.merge(true_data, resampled_data, on='site_code')
-    percent_true['true_data_percentage'] = percent_true['true_Count'] / percent_true['resampled_Count']
+    percent_true['true_data_percentage'] = percent_true['true_count'] / percent_true['resampled_count']
+    percent_true.to_csv(output_path + 'percent_true.csv')
 
     return all_rain
 
 def round_up_to_interval(ts):
     
-    """round ts up to 4/8/12 AM/PM interval"""
+    """round ts up to 4/8/12 AM/PM interval (4-hourly release of early warning information)"""
     
     hour = ts.hour
     rounded_up = ts + pd.to_timedelta(4 - (hour % 4), unit='h')
     
     return rounded_up.replace(minute=0, second=0, microsecond=0)
 
-def rainfall_alert(multiplier, start, end=None, select_sites=False, sites=None, to_csv=False, percent_true_rain=False):
+def rainfall_alert(start, end=None, to_csv=False):
     
-    """Get rainfall alert based on rainfall threshold exceedance with varying multipliers
-    
-        Args:
-            multiplier (int): variable for threshold
+    """Get rainfall alert based on rainfall threshold exceedance
+
         Returns:
             rainfall_alerts (dataframe): rainfall data exceeding threshold for all sites;
                     contains ts, data_id, rain, source, OneDayCumulative,
                    ThreeDayCumulative, site_code, threshold_value
     """
     
-    all_rain = get_rain_data(start, end, select_sites, sites, to_csv, percent_true_rain)
+    all_rain = get_rain_data(start, end, to_csv, )
     
     rainfall_alerts = all_rain[
-        (all_rain['OneDayCumulative'] > ((all_rain['threshold_value']/2)*multiplier)) 
-        | (all_rain['ThreeDayCumulative'] > (all_rain['threshold_value']*multiplier))]
+        (all_rain['OneDayCumulative'] > ((all_rain['threshold_value']/2))) 
+        | (all_rain['ThreeDayCumulative'] > (all_rain['threshold_value']))]
     rainfall_alerts = rainfall_alerts.reset_index()
     
     return rainfall_alerts
 
-def get_nonexceeding(multiplier, start, end=None, select_sites=False, sites=None, to_csv=False, percent_true_rain=False):
+def get_nonexceeding(start, end=None, to_csv=False):
     
     """Get instances when rainfall value is more than 75% but less than 100% of
-        rainfall threshold with varying multipliers
+        rainfall threshold 
     
-        Args:
-            multiplier (int): variable for threshold
         Returns:
-            rx (dataframe):  rainfall data with values between 75% - 100% of the
+            nonexceeding (dataframe):  rainfall data with values between 75% - 100% of the
                 threshold for all sites; contains ts, data_id, rain, source,
                 OneDayCumulative, ThreeDayCumulative, site_code, threshold_value
     """
     
-    all_rain = get_rain_data(start, end, select_sites, sites, to_csv, percent_true_rain)
+    all_rain = get_rain_data(start, end, to_csv)
 
-    nonexceeding = all_rain[(all_rain['OneDayCumulative'].between((((all_rain['threshold_value']*multiplier)/2)*0.75), ((all_rain['threshold_value']*multiplier)/2))) 
-                  | (all_rain['ThreeDayCumulative'].between(((all_rain['threshold_value']*multiplier)*0.75), ((all_rain['threshold_value']*multiplier))))]
+    nonexceeding = all_rain[(all_rain['OneDayCumulative'].between((((all_rain['threshold_value'])/2)*0.75), ((all_rain['threshold_value'])/2))) 
+                  | (all_rain['ThreeDayCumulative'].between(((all_rain['threshold_value'])*0.75), ((all_rain['threshold_value']))))]
     nonexceeding = nonexceeding.reset_index() 
     
     return nonexceeding
 
 
-def rainfall_event(multiplier, start, end=None, select_sites=False, sites=None, to_csv=False, percent_true_rain=False):    
+def rainfall_event(start, end=None, to_csv=False):    
     
     """Create rainfall event based on current protocol
     
@@ -199,7 +198,7 @@ def rainfall_event(multiplier, start, end=None, select_sites=False, sites=None, 
             rainfall_events (dataframe): site_code, event_id, start, end
     """
     
-    rainfall_alerts = rainfall_alert(multiplier, start, end, select_sites, sites, to_csv, percent_true_rain)
+    rainfall_alerts = rainfall_alert(start, end, to_csv)
     rainfall_alerts = rainfall_alerts.groupby('site_code')
     
     rainfall_events = {'site_code': [], 'event_id': [], 'start': [], 'end': []}
@@ -234,27 +233,28 @@ def rainfall_event(multiplier, start, end=None, select_sites=False, sites=None, 
 
     return rainfall_events
 
-def ground_movement(start, end):
-    
-    #ground movement
-    query_movement = "SELECT event_id, site_code, ANY_VALUE(trigger_list) as triggers, "
-    query_movement += "ANY_VALUE(ts) AS trigger_ts, event_start, validity "
-    query_movement += "FROM ewi_db.monitoring_releases "
-    query_movement += "LEFT JOIN ewi_db.monitoring_triggers USING (release_id) "
-    query_movement += "LEFT JOIN ewi_db.monitoring_event_alerts using (event_alert_id) "
-    query_movement += "LEFT JOIN ewi_db.monitoring_events using (event_id) "
-    query_movement += "LEFT JOIN commons_db.sites using (site_id) "
-    query_movement += "WHERE trigger_list IS NOT NULL "
-    query_movement += "AND site_code NOT REGEXP 'tes|phi' "
-    query_movement += "AND trigger_list REGEXP 's|g|m' "
-    query_movement += " AND event_start > '{start}' ".format(start=start)
-    query_movement += " AND validity <'{end}'".format(end=end)
-    query_movement += "GROUP BY event_id "
-    movement = db.df_read(query_movement)
-    
+def ground_movement(start, end, sql=True, to_csv=False):
+    if sql:
+        query_movement = "SELECT event_id, site_code, ANY_VALUE(trigger_list) as triggers, "
+        query_movement += "ANY_VALUE(ts) AS trigger_ts, event_start, validity "
+        query_movement += "FROM ewi_db.monitoring_releases "
+        query_movement += "LEFT JOIN ewi_db.monitoring_triggers USING (release_id) "
+        query_movement += "LEFT JOIN ewi_db.monitoring_event_alerts using (event_alert_id) "
+        query_movement += "LEFT JOIN ewi_db.monitoring_events using (event_id) "
+        query_movement += "LEFT JOIN commons_db.sites using (site_id) "
+        query_movement += "WHERE trigger_list REGEXP 's|g|m' "
+        query_movement += " AND event_start > '{start}' ".format(start=start)
+        query_movement += " AND validity <'{end}'".format(end=end)
+        query_movement += "GROUP BY event_id "
+        movement = db.df_read(query_movement)
+        if to_csv:
+            movement.to_csv(output_path + 'movement.csv')
+    else:
+        movement = pd.read_csv(output_path + 'movement.csv')
+
     return movement
 
-def confusion_matrix(multiplier, start, end=None, select_sites=False, sites=None, to_csv=False, percent_true_rain=False):
+def confusion_matrix(start, end=None, to_csv=False):
     
     """rainfall data-based confusion matrix
     
@@ -264,8 +264,8 @@ def confusion_matrix(multiplier, start, end=None, select_sites=False, sites=None
     """
     movement = ground_movement(start, end)
     
-    rainfall_events = rainfall_event(multiplier, start, end, select_sites, sites, to_csv, percent_true_rain)
-    rainfall_nonexceeding = get_nonexceeding(multiplier, start, end, to_csv, percent_true_rain)
+    rainfall_events = rainfall_event(start, end, to_csv)
+    rainfall_nonexceeding = get_nonexceeding(start, end, to_csv)
     events = pd.merge(rainfall_events, movement, on='site_code', suffixes=('_rainfall_events', '_movement'))
     non_events = pd.merge(rainfall_nonexceeding, movement, on='site_code', suffixes=('_rainfall_rx', '_movement'))
     
@@ -304,22 +304,15 @@ def confusion_matrix(multiplier, start, end=None, select_sites=False, sites=None
     
     return TP_site, FP_site, TN_site, FN_site
     
-def ROC(multiplier, start, end=None, to_csv=False, percent_true_rain=False):
-    
+def ROC(start, end=None, sql=True to_csv=False):   
     """Summary of confusion matrix and derived skills scores for each site
-    
-        Args:
-            excluded_sites (str): sites to be removed from plot
-            remove_sites (bool): exclude sites after initial analysis
             
         Returns:
             Matrix (dataframe): TP, FP, TN, FN, TPR, FPR, FNR, TNR, Prevalence,
-            Precision, NPV, F1_score
-           
+            Precision, NPV, F1_score          
     """
     
-    TP_site, FP_site, TN_site, FN_site = confusion_matrix(multiplier, start, end, to_csv, percent_true_rain)
-    # movement_sites = ground_movement(start, end).groupby('site_code').size()
+    TP_site, FP_site, TN_site, FN_site = confusion_matrix(start, end, to_csv)
     
     matrix = pd.concat([TP_site, FP_site, TN_site, FN_site], axis=1, keys=['TP','FP','TN','FN'])
     matrix = matrix.fillna(0).astype(int)
@@ -335,13 +328,13 @@ def ROC(multiplier, start, end=None, to_csv=False, percent_true_rain=False):
     matrix['F1_score'] = (2 * matrix['Precision'] * matrix['TPR']) / (matrix['Precision'] + matrix['TPR'])     
     
     matrix = matrix.sort_values(by='site_code')
-    matrix.to_csv(output+'ROCtest1.csv')
+    matrix.to_csv(output_path + 'prc_curve.png')
     
     return matrix
 
-def ROC_plot(multiplier, start, remove_sites = False, exluded_sites = None, end=None, select_sites=False, sites=None, to_csv=False, percent_true_rain=False):
+def ROC_plot(start, end=None, to_csv=False):
 
-    matrix = ROC(multiplier, start, remove_sites, exluded_sites, end, select_sites, sites, to_csv, percent_true_rain)
+    matrix = ROC(start, end, to_csv)
     print(matrix)
     
     x = matrix['TPR']
@@ -388,12 +381,12 @@ def ROC_plot(multiplier, start, remove_sites = False, exluded_sites = None, end=
     text = "{ROC_percentage}".format(ROC_percentage=ROC_percentage)
     plt.text(0.67, 0.07, text, fontsize=10, bbox=dict(facecolor='white', edgecolor='none'))
     
-    plt.savefig(output + 'roc_curve.png', dpi=400, bbox_inches='tight')
+    plt.savefig(output_path + 'roc_curve.png', dpi=400, bbox_inches='tight')
     plt.show()
     
-def precision_recall(multiplier, start, remove_sites = False, exluded_sites = None, end=None, select_sites=False, sites=None, to_csv=False, percent_true_rain=False):
+def precision_recall(start, end=None, to_csv=False):
     
-    matrix = ROC(multiplier, start, remove_sites, exluded_sites, end, select_sites, sites, to_csv, percent_true_rain)
+    matrix = ROC(start, end, to_csv)
     
     plt.figure(figsize=(7, 5))
     plt.scatter(matrix['TPR'], matrix['Precision'], c=(0.5607843137254902, 0.6666666666666666, 0.8627450980392157),
@@ -454,25 +447,23 @@ def precision_recall(multiplier, start, remove_sites = False, exluded_sites = No
     print('-------------Precision-recall-------------')
     print("Percentage above the line: {:.2f}%".format(pr_results))    
 
-    plt.savefig(os.path.join(output_path, 'prc_curve.png'), dpi=400, bbox_inches='tight')
+    plt.savefig(output_path + 'prc_curve.png', dpi=400, bbox_inches='tight')
     plt.show()
     
 #################################################################################################
 
 if __name__ == '__main__':
+    run_start = datetime.now()
 
     start = pd.to_datetime('2016-09-16 00:00:00')
     end = pd.to_datetime('2022-07-14 00:00:00')
-    multiplier = 2
     to_csv = False
-    
+    sql = True
     output_path = os.path.dirname(os.path.abspath(__file__))
         
-    ROC(multiplier, start, end, to_csv)
+    ROC(start, end, sql, to_csv)
     ROC_plot()
     precision_recall()
     
-    
-    run_start = datetime.now()
     runtime = datetime.now() - run_start
     print("runtime = {}".format(runtime))
